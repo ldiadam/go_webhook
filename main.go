@@ -53,6 +53,20 @@ type DeployResult struct {
 	Duration    string `json:"duration"`
 }
 
+// DeployJob represents an async deployment job.
+type DeployJob struct {
+	JobID       string     `json:"job_id"`
+	ContainerID string     `json:"container_id"`
+	Path        string     `json:"path"`
+	Status      string     `json:"status"` // pending, running, completed, failed
+	Output      string     `json:"output"`
+	Error       string     `json:"error,omitempty"`
+	StartedAt   time.Time  `json:"started_at"`
+	CompletedAt time.Time  `json:"completed_at,omitempty"`
+	Duration    string     `json:"duration,omitempty"`
+	mu          sync.Mutex `json:"-"`
+}
+
 // =============================================================================
 // STORAGE (JSON FILE WITH MUTEX)
 // =============================================================================
@@ -63,6 +77,9 @@ var (
 	storageMu sync.RWMutex
 	// deployMu holds per-container mutexes to prevent parallel deploys
 	deployMu sync.Map
+	// jobStore holds async deploy jobs
+	jobStore   = make(map[string]*DeployJob)
+	jobStoreMu sync.RWMutex
 )
 
 // getDeployMutex returns a mutex for the given container ID.
@@ -450,7 +467,26 @@ func handleDeleteContainer(w http.ResponseWriter, r *http.Request) {
 // HANDLERS: DEPLOY
 // =============================================================================
 
-// handleDeploy triggers a deployment for a container.
+// generateJobID creates a unique job ID.
+func generateJobID() string {
+	return fmt.Sprintf("%d", time.Now().UnixNano())
+}
+
+// storeJob stores a job in the job store.
+func storeJob(job *DeployJob) {
+	jobStoreMu.Lock()
+	defer jobStoreMu.Unlock()
+	jobStore[job.JobID] = job
+}
+
+// getJob retrieves a job from the job store.
+func getJob(jobID string) *DeployJob {
+	jobStoreMu.RLock()
+	defer jobStoreMu.RUnlock()
+	return jobStore[jobID]
+}
+
+// handleDeploy triggers an async deployment for a container.
 func handleDeploy(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	id := vars["id"]
@@ -480,37 +516,126 @@ func handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Acquire per-container mutex (prevent parallel deploys to same container)
+	// Check if there's already a deploy in progress for this container
 	mu := getDeployMutex(id)
 	if !mu.TryLock() {
 		sendError(w, http.StatusConflict, "deployment already in progress for this container")
 		return
 	}
-	defer mu.Unlock()
 
-	log.Printf("[DEPLOY START] Container %s at %s", id, container.Path)
-	start := time.Now()
+	// Create a new job
+	job := &DeployJob{
+		JobID:       generateJobID(),
+		ContainerID: id,
+		Path:        container.Path,
+		Status:      "pending",
+		StartedAt:   time.Now(),
+	}
+	storeJob(job)
 
-	// Execute deployment
-	output, err := executeDeploy(container.Path)
-	duration := time.Since(start)
+	log.Printf("[DEPLOY QUEUED] Job %s for container %s at %s", job.JobID, id, container.Path)
 
-	if err != nil {
-		log.Printf("[DEPLOY FAILED] Container %s: %v", id, err)
-		sendError(w, http.StatusInternalServerError, fmt.Sprintf("deployment failed: %s\n\nOutput:\n%s", err.Error(), output))
+	// Run deployment in background
+	go func() {
+		defer mu.Unlock()
+
+		job.mu.Lock()
+		job.Status = "running"
+		job.mu.Unlock()
+
+		log.Printf("[DEPLOY START] Job %s - Container %s at %s", job.JobID, id, container.Path)
+
+		// Execute deployment
+		output, err := executeDeploy(container.Path)
+		completedAt := time.Now()
+		duration := completedAt.Sub(job.StartedAt)
+
+		job.mu.Lock()
+		job.Output = output
+		job.CompletedAt = completedAt
+		job.Duration = duration.String()
+
+		if err != nil {
+			job.Status = "failed"
+			job.Error = err.Error()
+			log.Printf("[DEPLOY FAILED] Job %s - Container %s: %v", job.JobID, id, err)
+		} else {
+			job.Status = "completed"
+			log.Printf("[DEPLOY SUCCESS] Job %s - Container %s completed in %v", job.JobID, id, duration)
+		}
+		job.mu.Unlock()
+	}()
+
+	// Return job ID immediately
+	sendSuccessWithMessage(w, http.StatusAccepted,
+		fmt.Sprintf("Deployment queued. Check status at GET /deploy/%s/status?job_id=%s", id, job.JobID),
+		map[string]string{
+			"job_id":       job.JobID,
+			"container_id": id,
+			"status":       "pending",
+			"status_url":   fmt.Sprintf("/deploy/%s/status?job_id=%s", id, job.JobID),
+		})
+}
+
+// handleDeployStatus returns the status of an async deployment job.
+func handleDeployStatus(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+	jobID := r.URL.Query().Get("job_id")
+
+	if jobID == "" {
+		// Return latest job for this container
+		jobStoreMu.RLock()
+		var latestJob *DeployJob
+		for _, job := range jobStore {
+			if job.ContainerID == id {
+				if latestJob == nil || job.StartedAt.After(latestJob.StartedAt) {
+					latestJob = job
+				}
+			}
+		}
+		jobStoreMu.RUnlock()
+
+		if latestJob == nil {
+			sendError(w, http.StatusNotFound, "no deployment jobs found for this container")
+			return
+		}
+		jobID = latestJob.JobID
+	}
+
+	job := getJob(jobID)
+	if job == nil {
+		sendError(w, http.StatusNotFound, "job not found")
 		return
 	}
 
-	log.Printf("[DEPLOY SUCCESS] Container %s completed in %v", id, duration)
-
-	result := DeployResult{
-		ContainerID: id,
-		Path:        container.Path,
-		Status:      "completed",
-		Output:      output,
-		Duration:    duration.String(),
+	if job.ContainerID != id {
+		sendError(w, http.StatusBadRequest, "job does not belong to this container")
+		return
 	}
-	sendSuccess(w, fmt.Sprintf("Deployment of '%s' completed successfully in %s", id, duration.String()), result)
+
+	job.mu.Lock()
+	response := map[string]interface{}{
+		"job_id":       job.JobID,
+		"container_id": job.ContainerID,
+		"path":         job.Path,
+		"status":       job.Status,
+		"started_at":   job.StartedAt.Format(time.RFC3339),
+		"output":       job.Output,
+	}
+
+	if !job.CompletedAt.IsZero() {
+		response["completed_at"] = job.CompletedAt.Format(time.RFC3339)
+		response["duration"] = job.Duration
+	}
+
+	if job.Error != "" {
+		response["error"] = job.Error
+	}
+	job.mu.Unlock()
+
+	message := fmt.Sprintf("Job %s status: %s", jobID, job.Status)
+	sendSuccess(w, message, response)
 }
 
 // executeDeploy runs the deployment commands in the specified directory.
@@ -662,8 +787,9 @@ func main() {
 	r.HandleFunc("/containers/{id}", handleUpdateContainer).Methods("PUT")
 	r.HandleFunc("/containers/{id}", handleDeleteContainer).Methods("DELETE")
 
-	// Deploy endpoint
+	// Deploy endpoints
 	r.HandleFunc("/deploy/{id}", handleDeploy).Methods("POST")
+	r.HandleFunc("/deploy/{id}/status", handleDeployStatus).Methods("GET")
 
 	log.Printf("Deploy server starting on port %s", port)
 	log.Printf("Data file: %s", dataFile)
