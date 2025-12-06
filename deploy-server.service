@@ -1,0 +1,37 @@
+[Unit]
+Description=Host-Side Deployment Server
+Documentation=https://github.com/your-org/deploy-server
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/opt/deploy-server
+ExecStart=/opt/deploy-server/deploy-server
+Restart=always
+RestartSec=5
+
+# Environment
+Environment=PORT=8080
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/opt/deploy-server
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=deploy-server
+
+# Resource limits
+LimitNOFILE=65535
+MemoryMax=256M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target
