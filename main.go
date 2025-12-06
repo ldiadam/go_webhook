@@ -30,14 +30,25 @@ type Container struct {
 
 // APIResponse is the standard JSON response format.
 type APIResponse struct {
-	Success bool        `json:"success"`
-	Data    interface{} `json:"data,omitempty"`
-	Error   string      `json:"error,omitempty"`
+	Success   bool        `json:"success"`
+	Message   string      `json:"message"`
+	Data      interface{} `json:"data,omitempty"`
+	Error     string      `json:"error,omitempty"`
+	Timestamp string      `json:"timestamp"`
+}
+
+// ContainerResponse includes container info with metadata.
+type ContainerResponse struct {
+	ID        string `json:"id"`
+	Path      string `json:"path"`
+	HasSecret bool   `json:"has_secret"`
 }
 
 // DeployResult contains the output from a deployment operation.
 type DeployResult struct {
 	ContainerID string `json:"container_id"`
+	Path        string `json:"path"`
+	Status      string `json:"status"`
 	Output      string `json:"output"`
 	Duration    string `json:"duration"`
 }
@@ -67,9 +78,16 @@ func loadContainers() ([]Container, error) {
 
 	// Create file if it doesn't exist
 	if _, err := os.Stat(dataFile); os.IsNotExist(err) {
+		log.Printf("[STORAGE] Creating new data file: %s", dataFile)
+		storageMu.RUnlock()
+		storageMu.Lock()
 		if err := os.WriteFile(dataFile, []byte("[]"), 0644); err != nil {
+			storageMu.Unlock()
+			storageMu.RLock()
 			return nil, fmt.Errorf("failed to create data file: %w", err)
 		}
+		storageMu.Unlock()
+		storageMu.RLock()
 		return []Container{}, nil
 	}
 
@@ -78,9 +96,38 @@ func loadContainers() ([]Container, error) {
 		return nil, fmt.Errorf("failed to read data file: %w", err)
 	}
 
+	// Handle empty file
+	if len(data) == 0 {
+		log.Printf("[STORAGE] Empty data file, initializing with empty array")
+		return []Container{}, nil
+	}
+
 	var containers []Container
 	if err := json.Unmarshal(data, &containers); err != nil {
-		return nil, fmt.Errorf("failed to parse data file: %w", err)
+		// Log the corrupted content for debugging (first 100 chars)
+		preview := string(data)
+		if len(preview) > 100 {
+			preview = preview[:100] + "..."
+		}
+		log.Printf("[STORAGE] Corrupted data file detected. Preview: %q", preview)
+		log.Printf("[STORAGE] Backing up corrupted file and resetting to empty array")
+
+		// Backup corrupted file
+		backupFile := dataFile + ".corrupted." + fmt.Sprintf("%d", time.Now().Unix())
+		os.WriteFile(backupFile, data, 0644)
+
+		// Reset to empty array
+		storageMu.RUnlock()
+		storageMu.Lock()
+		if err := os.WriteFile(dataFile, []byte("[]"), 0644); err != nil {
+			storageMu.Unlock()
+			storageMu.RLock()
+			return nil, fmt.Errorf("failed to reset data file: %w", err)
+		}
+		storageMu.Unlock()
+		storageMu.RLock()
+
+		return []Container{}, nil
 	}
 
 	return containers, nil
@@ -204,14 +251,29 @@ func sendJSON(w http.ResponseWriter, status int, data interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
+// sendSuccessWithMessage sends a successful JSON response with a message.
+func sendSuccessWithMessage(w http.ResponseWriter, status int, message string, data interface{}) {
+	sendJSON(w, status, APIResponse{
+		Success:   true,
+		Message:   message,
+		Data:      data,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
 // sendSuccess sends a successful JSON response.
-func sendSuccess(w http.ResponseWriter, data interface{}) {
-	sendJSON(w, http.StatusOK, APIResponse{Success: true, Data: data})
+func sendSuccess(w http.ResponseWriter, message string, data interface{}) {
+	sendSuccessWithMessage(w, http.StatusOK, message, data)
 }
 
 // sendError sends an error JSON response.
-func sendError(w http.ResponseWriter, status int, message string) {
-	sendJSON(w, status, APIResponse{Success: false, Error: message})
+func sendError(w http.ResponseWriter, status int, errMessage string) {
+	sendJSON(w, status, APIResponse{
+		Success:   false,
+		Message:   "Request failed",
+		Error:     errMessage,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
 }
 
 // parseJSONBody parses the JSON body into the target struct.
@@ -267,8 +329,10 @@ func handleCreateContainer(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[CREATED] Container %s at %s", input.ID, input.Path)
 
 	// Return without secret
-	output := Container{ID: input.ID, Path: input.Path}
-	sendJSON(w, http.StatusCreated, APIResponse{Success: true, Data: output})
+	output := ContainerResponse{ID: input.ID, Path: input.Path, HasSecret: true}
+	sendSuccessWithMessage(w, http.StatusCreated,
+		fmt.Sprintf("Container '%s' created successfully. Deploy via POST /deploy/%s?secret=YOUR_SECRET", input.ID, input.ID),
+		output)
 }
 
 // handleListContainers lists all containers (without secrets).
@@ -280,12 +344,12 @@ func handleListContainers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Strip secrets from response
-	output := make([]Container, len(containers))
+	output := make([]ContainerResponse, len(containers))
 	for i, c := range containers {
-		output[i] = Container{ID: c.ID, Path: c.Path}
+		output[i] = ContainerResponse{ID: c.ID, Path: c.Path, HasSecret: c.Secret != ""}
 	}
 
-	sendSuccess(w, output)
+	sendSuccess(w, fmt.Sprintf("Found %d container(s)", len(containers)), output)
 }
 
 // handleGetContainer gets a single container by ID.
@@ -306,8 +370,8 @@ func handleGetContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Return without secret
-	output := Container{ID: container.ID, Path: container.Path}
-	sendSuccess(w, output)
+	output := ContainerResponse{ID: container.ID, Path: container.Path, HasSecret: container.Secret != ""}
+	sendSuccess(w, fmt.Sprintf("Container '%s' found. Deploy via POST /deploy/%s?secret=YOUR_SECRET", id, id), output)
 }
 
 // handleUpdateContainer updates an existing container.
@@ -350,8 +414,8 @@ func handleUpdateContainer(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[UPDATED] Container %s", id)
 
 	// Return without secret
-	output := Container{ID: input.ID, Path: input.Path}
-	sendSuccess(w, output)
+	output := ContainerResponse{ID: input.ID, Path: input.Path, HasSecret: true}
+	sendSuccess(w, fmt.Sprintf("Container '%s' updated successfully", id), output)
 }
 
 // handleDeleteContainer deletes a container by ID.
@@ -379,7 +443,7 @@ func handleDeleteContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[DELETED] Container %s", id)
-	sendSuccess(w, map[string]string{"deleted": id})
+	sendSuccess(w, fmt.Sprintf("Container '%s' deleted successfully", id), map[string]string{"deleted_id": id})
 }
 
 // =============================================================================
@@ -441,10 +505,12 @@ func handleDeploy(w http.ResponseWriter, r *http.Request) {
 
 	result := DeployResult{
 		ContainerID: id,
+		Path:        container.Path,
+		Status:      "completed",
 		Output:      output,
 		Duration:    duration.String(),
 	}
-	sendSuccess(w, result)
+	sendSuccess(w, fmt.Sprintf("Deployment of '%s' completed successfully in %s", id, duration.String()), result)
 }
 
 // executeDeploy runs the deployment commands in the specified directory.
@@ -488,9 +554,9 @@ func executeDeploy(path string) (string, error) {
 
 // handleHealth returns a simple health check response.
 func handleHealth(w http.ResponseWriter, r *http.Request) {
-	sendSuccess(w, map[string]string{
-		"status": "healthy",
-		"time":   time.Now().UTC().Format(time.RFC3339),
+	sendSuccess(w, "Deploy server is running", map[string]string{
+		"status":  "healthy",
+		"version": "1.0.0",
 	})
 }
 
