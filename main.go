@@ -517,34 +517,110 @@ func handleDeploy(w http.ResponseWriter, r *http.Request) {
 func executeDeploy(path string) (string, error) {
 	var output bytes.Buffer
 
+	log.Printf("[DEPLOY] Starting deployment execution for path: %s", path)
+
 	// Verify path exists
 	if _, err := os.Stat(path); os.IsNotExist(err) {
+		log.Printf("[DEPLOY ERROR] Path does not exist: %s", path)
 		return "", fmt.Errorf("path does not exist: %s", path)
+	}
+	log.Printf("[DEPLOY] Path verified: %s", path)
+
+	// Check if path is a git repository
+	gitDir := filepath.Join(path, ".git")
+	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
+		log.Printf("[DEPLOY WARNING] Path is not a git repository (no .git directory): %s", path)
+	} else {
+		log.Printf("[DEPLOY] Git repository detected at: %s", path)
+	}
+
+	// Check for docker-compose file
+	composeFiles := []string{"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}
+	composeFound := false
+	for _, cf := range composeFiles {
+		composePath := filepath.Join(path, cf)
+		if _, err := os.Stat(composePath); err == nil {
+			log.Printf("[DEPLOY] Found compose file: %s", composePath)
+			composeFound = true
+			break
+		}
+	}
+	if !composeFound {
+		log.Printf("[DEPLOY WARNING] No docker-compose file found in: %s", path)
 	}
 
 	commands := []struct {
-		name string
-		args []string
+		name        string
+		args        []string
+		description string
 	}{
-		{"git", []string{"reset", "--hard"}},
-		{"git", []string{"clean", "-fd"}},
-		{"git", []string{"pull"}},
-		{"docker", []string{"compose", "up", "-d", "--build", "--force-recreate"}},
+		{"git", []string{"reset", "--hard"}, "Git Reset (discard local changes)"},
+		{"git", []string{"clean", "-fd"}, "Git Clean (remove untracked files)"},
+		{"git", []string{"pull"}, "Git Pull (fetch latest changes)"},
+		{"docker", []string{"compose", "up", "-d", "--build", "--force-recreate"}, "Docker Compose Build & Start"},
 	}
 
-	for _, cmd := range commands {
-		output.WriteString(fmt.Sprintf("\n=== %s %s ===\n", cmd.name, strings.Join(cmd.args, " ")))
+	for i, cmd := range commands {
+		stepNum := i + 1
+		cmdStr := fmt.Sprintf("%s %s", cmd.name, strings.Join(cmd.args, " "))
+
+		log.Printf("[DEPLOY STEP %d/%d] Starting: %s", stepNum, len(commands), cmd.description)
+		log.Printf("[DEPLOY STEP %d/%d] Command: %s", stepNum, len(commands), cmdStr)
+		log.Printf("[DEPLOY STEP %d/%d] Working directory: %s", stepNum, len(commands), path)
+
+		output.WriteString(fmt.Sprintf("\n=== STEP %d: %s ===\n", stepNum, cmd.description))
+		output.WriteString(fmt.Sprintf("Command: %s\n", cmdStr))
+		output.WriteString(fmt.Sprintf("Directory: %s\n", path))
+		output.WriteString("---\n")
+
+		stepStart := time.Now()
 
 		c := exec.Command(cmd.name, cmd.args...)
 		c.Dir = path
-		c.Stdout = &output
-		c.Stderr = &output
 
-		if err := c.Run(); err != nil {
-			return output.String(), fmt.Errorf("command failed: %s %s: %w", cmd.name, strings.Join(cmd.args, " "), err)
+		// Capture stdout and stderr separately for better debugging
+		var stdoutBuf, stderrBuf bytes.Buffer
+		c.Stdout = io.MultiWriter(&output, &stdoutBuf)
+		c.Stderr = io.MultiWriter(&output, &stderrBuf)
+
+		// Log environment info
+		log.Printf("[DEPLOY STEP %d/%d] Executing command...", stepNum, len(commands))
+
+		err := c.Run()
+		stepDuration := time.Since(stepStart)
+
+		// Log stdout if any
+		if stdoutBuf.Len() > 0 {
+			log.Printf("[DEPLOY STEP %d/%d] STDOUT:\n%s", stepNum, len(commands), stdoutBuf.String())
 		}
+
+		// Log stderr if any
+		if stderrBuf.Len() > 0 {
+			log.Printf("[DEPLOY STEP %d/%d] STDERR:\n%s", stepNum, len(commands), stderrBuf.String())
+		}
+
+		output.WriteString(fmt.Sprintf("---\nStep duration: %v\n", stepDuration))
+
+		if err != nil {
+			exitCode := -1
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				exitCode = exitErr.ExitCode()
+			}
+			log.Printf("[DEPLOY STEP %d/%d] FAILED after %v", stepNum, len(commands), stepDuration)
+			log.Printf("[DEPLOY STEP %d/%d] Exit code: %d", stepNum, len(commands), exitCode)
+			log.Printf("[DEPLOY STEP %d/%d] Error: %v", stepNum, len(commands), err)
+
+			output.WriteString(fmt.Sprintf("Exit code: %d\n", exitCode))
+			output.WriteString(fmt.Sprintf("Error: %v\n", err))
+
+			return output.String(), fmt.Errorf("step %d (%s) failed with exit code %d: %s: %w", stepNum, cmd.description, exitCode, cmdStr, err)
+		}
+
+		log.Printf("[DEPLOY STEP %d/%d] SUCCESS in %v", stepNum, len(commands), stepDuration)
+		output.WriteString("Status: SUCCESS\n")
 	}
 
+	log.Printf("[DEPLOY] All deployment steps completed successfully")
 	return output.String(), nil
 }
 
